@@ -75,10 +75,16 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,prefix=sha-,enable=${{ github.ref == 'refs/heads/main' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+
+      - name: Refuse to publish without tags
+        if: steps.publish.outputs.enabled == 'true' && steps.meta.outputs.tags == ''
+        run: |
+          echo "::error::publishing is enabled but metadata-action produced no tags for ${{ github.ref }}"
+          exit 1
 
       - name: Log in to Docker Hub
         if: steps.publish.outputs.enabled == 'true'
