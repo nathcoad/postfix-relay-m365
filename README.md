@@ -142,13 +142,13 @@ docker compose ps        # healthy
 
 [.github/workflows/ci.yml](.github/workflows/ci.yml) runs the unit tests,
 shellcheck, hadolint, a `docker compose config` render and an image build on
-every push and pull request. Pushes to `master` and `v*` tags publish a
+every push and pull request. Pushes to `main` and `v*` tags publish a
 multi-arch (`linux/amd64`, `linux/arm64`) image to Docker Hub as
 [encode/postfix-relay-m365](https://hub.docker.com/r/encode/postfix-relay-m365):
 
 | Event | Tags |
 |---|---|
-| push to `master` | `latest`, `sha-<short commit>` |
+| push to `main` | `latest`, `sha-<short commit>` |
 | tag `vX.Y.Z` | `X.Y.Z`, `X.Y` |
 
 Publishing needs the repository secrets `DOCKERHUB_USERNAME` and

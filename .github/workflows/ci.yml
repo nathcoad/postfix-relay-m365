@@ -1,7 +1,7 @@
 name: CI
 
 # Every push and pull request: unit tests, lints, compose render and a
-# single-arch image build.  Pushes to master and v* tags additionally publish
+# single-arch image build.  Pushes to main and v* tags additionally publish
 # a multi-arch image to Docker Hub as encode/postfix-relay-m365.
 #
 # Required repository secrets for publishing:
@@ -62,7 +62,7 @@ jobs:
       - name: Decide whether to publish
         id: publish
         env:
-          ENABLED: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
+          ENABLED: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
         run: echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
@@ -87,8 +87,8 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Pull requests and feature branches: amd64 build only, nothing pushed.
-      # master and tags: amd64 + arm64, pushed with the tags from metadata-action.
-      - name: Build (and push on master / tags)
+      # main and tags: amd64 + arm64, pushed with the tags from metadata-action.
+      - name: Build (and push on main / tags)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -119,7 +119,7 @@ jobs:
           docker run --rm "$REF" grep -q 'VERSION_ID="24.04"' /etc/os-release
 
       - name: Sync README to Docker Hub
-        if: steps.publish.outputs.enabled == 'true' && github.ref == 'refs/heads/master'
+        if: steps.publish.outputs.enabled == 'true' && github.ref == 'refs/heads/main'
         uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}

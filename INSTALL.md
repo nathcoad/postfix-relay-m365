@@ -55,7 +55,7 @@ Docker host side
   `smtp.office365.com:587`.
 - Access to the image: either build it locally from this repository or pull
   `encode/postfix-relay-m365` from Docker Hub (published by GitHub Actions on
-  every push to `master` and on version tags).
+  every push to `main` and on version tags).
 
 You will collect four values as you go:
 
