@@ -6,7 +6,8 @@ name: CI
 #
 # Required repository secrets for publishing:
 #   DOCKERHUB_USERNAME  Docker Hub account (encode)
-#   DOCKERHUB_TOKEN     Docker Hub access token with Read & Write scope
+#   DOCKERHUB_TOKEN     Docker Hub access token with Read, Write & Delete scope
+#                       (Delete is only needed by the README sync step)
 
 on:
   push:
@@ -118,8 +119,12 @@ jobs:
           docker run --rm "$REF" dpkg-query -W -f='${Package} ${Version}\n' postfix sasl-xoauth2 python3
           docker run --rm "$REF" grep -q 'VERSION_ID="24.04"' /etc/os-release
 
+      # Needs a Docker Hub access token with Read, Write AND Delete scope (the
+      # image push itself only needs Read & Write).  Non-fatal: the image is
+      # already published by this point.
       - name: Sync README to Docker Hub
         if: steps.publish.outputs.enabled == 'true' && github.ref == 'refs/heads/main'
+        continue-on-error: true
         uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}

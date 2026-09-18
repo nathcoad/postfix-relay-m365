@@ -152,7 +152,8 @@ multi-arch (`linux/amd64`, `linux/arm64`) image to Docker Hub as
 | tag `vX.Y.Z` | `X.Y.Z`, `X.Y` |
 
 Publishing needs the repository secrets `DOCKERHUB_USERNAME` and
-`DOCKERHUB_TOKEN` (a Docker Hub access token with read/write scope).
+`DOCKERHUB_TOKEN` (a Docker Hub access token with Read, Write and Delete
+scope; Delete is only needed to sync this README to the Docker Hub page).
 
 ## postfix-relay
 
