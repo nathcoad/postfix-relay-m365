@@ -1,7 +1,8 @@
 # postfix-relay-m365
 
-[![CI](https://github.com/nathcoad/postfix-relay-m365/actions/workflows/ci.yml/badge.svg)](https://github.com/nathcoad/postfix-relay-m365/actions/workflows/ci.yml)
-[![Docker Hub](https://img.shields.io/docker/v/encode/postfix-relay-m365?label=docker%20hub&sort=semver)](https://hub.docker.com/r/encode/postfix-relay-m365)
+[![CI](https://github.com/nathcoad/postfix-relay-m365/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/nathcoad/postfix-relay-m365/actions/workflows/ci.yml?query=branch%3Amain)
+[![Docker image size](https://img.shields.io/docker/image-size/encode/postfix-relay-m365/latest?label=docker%20hub)](https://hub.docker.com/r/encode/postfix-relay-m365)
+[![Docker pulls](https://img.shields.io/docker/pulls/encode/postfix-relay-m365)](https://hub.docker.com/r/encode/postfix-relay-m365)
 
 Postfix SMTP relay for Microsoft 365 using **app-only (client credentials)
 OAuth 2.0** with sasl-xoauth2. No user mailbox login, no MFA breakage.
