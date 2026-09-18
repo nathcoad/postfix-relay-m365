@@ -1,0 +1,128 @@
+name: CI
+
+# Every push and pull request: unit tests, lints, compose render and a
+# single-arch image build.  Pushes to master and v* tags additionally publish
+# a multi-arch image to Docker Hub as encode/postfix-relay-m365.
+#
+# Required repository secrets for publishing:
+#   DOCKERHUB_USERNAME  Docker Hub account (encode)
+#   DOCKERHUB_TOKEN     Docker Hub access token with Read & Write scope
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  IMAGE: encode/postfix-relay-m365
+
+jobs:
+  test:
+    name: Unit tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.12 matches the python3 shipped in ubuntu:24.04.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile helpers and run unit tests
+        run: |
+          python3 -m py_compile bin/oauth-token-helper bin/smtp-send-test
+          python3 -m unittest discover -s tests -v
+
+      - name: shellcheck
+        run: shellcheck -S error run
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+      # Render the compose file with the example env.  The secret file is
+      # created empty so the file-backed secret resolves; nothing is started.
+      - name: docker compose config
+        run: |
+          mkdir -p secrets && touch secrets/oauth_client_secret
+          docker compose --env-file .env.example config -q
+
+  build:
+    name: Build and publish image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide whether to publish
+        id: publish
+        env:
+          ENABLED: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
+        run: echo "enabled=$ENABLED" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Log in to Docker Hub
+        if: steps.publish.outputs.enabled == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Pull requests and feature branches: amd64 build only, nothing pushed.
+      # master and tags: amd64 + arm64, pushed with the tags from metadata-action.
+      - name: Build (and push on master / tags)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ steps.publish.outputs.enabled == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ steps.publish.outputs.enabled == 'true' }}
+          load: ${{ steps.publish.outputs.enabled != 'true' }}
+          tags: ${{ steps.publish.outputs.enabled == 'true' && steps.meta.outputs.tags || format('{0}:ci', env.IMAGE) }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke test the amd64 image on every event: the helper CLI runs, the
+      # expected packages are installed and the base is 24.04.  A published
+      # multi-arch image is not loaded into the local daemon, so pull it back.
+      - name: Smoke test image
+        env:
+          PUBLISHED: ${{ steps.publish.outputs.enabled }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          if [ "$PUBLISHED" = "true" ]; then
+            REF="$(printf '%s\n' "$TAGS" | head -n1)"
+            docker pull --platform linux/amd64 "$REF"
+          else
+            REF="$IMAGE:ci"
+          fi
+          docker run --rm "$REF" oauth-token-helper --help >/dev/null
+          docker run --rm "$REF" dpkg-query -W -f='${Package} ${Version}\n' postfix sasl-xoauth2 python3
+          docker run --rm "$REF" grep -q 'VERSION_ID="24.04"' /etc/os-release
+
+      - name: Sync README to Docker Hub
+        if: steps.publish.outputs.enabled == 'true' && github.ref == 'refs/heads/master'
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.IMAGE }}
+          short-description: "Postfix SMTP relay for Microsoft 365 using app-only OAuth 2.0 (client credentials)"

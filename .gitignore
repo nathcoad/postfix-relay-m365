@@ -1,0 +1,30 @@
+# Local configuration and secrets - never commit real tenant IDs, client IDs,
+# client secrets or tokens.
+.env
+.env.*.local
+secrets/
+*.tokens.json
+*.tokens.json.*
+# The placeholder token file baked into the image for legacy mode is fine.
+!etc/tokens/sender.tokens.json
+
+# Private notes from the previous (delegated-token) deployment: contains real IDs.
+previous-implementation.md
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+.claude/settings.local.json
+
+# Cloud-sync duplicate artifacts ("name 2.ext"); never track them.
+* 2
+* 2.*
+
+# Internal wiki drafts: contain real tenant/client IDs.
+wiki-*.md
+agent.md
+skill.md
+tasks/

@@ -1,0 +1,16 @@
+.git
+README.md
+INSTALL.md
+LICENSE
+.env
+.env.*
+secrets
+tasks
+tests
+docker-compose.yml
+.gitignore
+agent.md
+skill.md
+previous-implementation.md
+.claude
+.github

@@ -1,0 +1,1 @@
+[smtp-relay.gmail.com]:587 yourmail@example.com:/etc/tokens/sender.tokens.json

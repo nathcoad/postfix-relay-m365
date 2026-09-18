@@ -1,0 +1,235 @@
+#!/bin/bash
+
+# DKIM config
+dkimConfig()
+{
+    postconf -e milter_protocol=2
+    postconf -e milter_default_action=accept
+    postconf -e smtpd_milters=inet:localhost:12301
+
+    # OPENDKIM_var env -> put "key value" line in /etc/opendkim.conf
+    echo -n > /etc/opendkim.conf
+    for e in ${!OPENDKIM_*} ; do
+      if [ "$e" == "OPENDKIM_DOMAINS" ] ; then
+        continue
+      fi
+      echo "${e:9} ${!e}" >> /etc/opendkim.conf
+    done
+
+    rm -f /etc/opendkim/KeyTable
+    rm -f /etc/opendkim/SigningTable
+
+    echo "DNS records:"
+    for d in $OPENDKIM_DOMAINS ; do
+      domain=$(echo "$d"| cut -f1 -d '=')
+      selector=$(expr match "$d" '.*\=\(.*\)')
+      if [ -z "$selector" ] ; then
+        selector="mail"
+      fi
+
+      domainDir="/etc/opendkim/keys/$domain"
+      privateFile="$domainDir/$selector.private"
+      txtFile="$domainDir/$selector.txt"
+      if [ ! -f "$privateFile" ] ; then
+        echo "No DKIM private key found for selector '$selector' in domain '$domain'. Generating one now..."
+        mkdir -p "$domainDir"
+        opendkim-genkey -D "$domainDir" --selector=$selector --domain=$domain --append-domain
+      fi
+
+      # Ensure strict permissions required by opendkim
+      chown opendkim:opendkim "$domainDir" "$privateFile"
+      chmod a=,u=rw "$privateFile"
+
+      echo "$selector._domainkey.$domain $domain:$selector:$privateFile" >> /etc/opendkim/KeyTable
+      echo "*@$domain $selector._domainkey.$domain" >> /etc/opendkim/SigningTable
+
+      cat "$txtFile"
+    done
+}
+
+# rsyslog config
+rsyslogConfig()
+{
+    # Rsyslog base
+    /bin/echo -e '$ModLoad imuxsock\n$WorkDirectory /var/spool/rsyslog\n\ninclude(file="/etc/rsyslog.d/*.conf")\n\n*.*;auth,authpriv.none /dev/stdout\n' > /etc/rsyslog.conf
+
+    if [ "${RSYSLOG_TIMESTAMP,,}" == 'no' ] ; then
+        echo '$template noTimestampFormat,"%syslogtag%%msg%\n"' >> /etc/rsyslog.conf
+        echo '$ActionFileDefaultTemplate noTimestampFormat' >> /etc/rsyslog.conf
+    fi
+
+    if [ "${RSYSLOG_LOG_TO_FILE,,}" == 'yes' ] ; then
+        echo 'mail.* -/var/log/mail.log' >> /etc/rsyslog.conf
+    fi
+
+    if [ "${RSYSLOG_REMOTE_TRANSPORT_PROTOCOL,,}" == 'tcp' ] ; then
+        RSYSLOG_REMOTE_TRANSPORT_PROTOCOL='tcp'
+    else
+        RSYSLOG_REMOTE_TRANSPORT_PROTOCOL='udp'
+    fi
+    if [ ! -z ${RSYSLOG_REMOTE_HOST} ] ; then
+        echo "*.* action(type=\"omfwd\" target=\"${RSYSLOG_REMOTE_HOST,,}\" port=\"${RSYSLOG_REMOTE_PORT}\" protocol=\"${RSYSLOG_REMOTE_TRANSPORT_PROTOCOL}\" template=\"${RSYSLOG_REMOTE_TEMPLATE}\")" >> /etc/rsyslog.conf
+    fi
+}
+
+# OAuth token handling.
+#
+# client_credentials mode (app-only, OAUTH_TENANT_ID/OAUTH_CLIENT_ID/secret set):
+#   oauth-token-helper obtains access tokens from Microsoft Entra and keeps the
+#   token file that sasl-xoauth2 reads (inside the Postfix chroot) fresh.  No
+#   user refresh token is involved, so mailbox MFA has no effect.
+# refresh_token mode (legacy, no OAUTH_* variables):
+#   nothing here runs; the mounted /etc/tokens/sender.tokens.json is copied
+#   into and out of the chroot exactly as before and sasl-xoauth2 refreshes it.
+oauthConfig()
+{
+    OAUTH_MODE=$(oauth-token-helper mode) || exit 1
+    echo "OAuth mode: ${OAUTH_MODE}"
+    if [ "${OAUTH_MODE}" != "client_credentials" ] ; then
+      return
+    fi
+    oauth-token-helper validate || exit 1
+
+    # sasl-xoauth2 insists on client_id/client_secret in its config file even
+    # though it never performs a refresh in this mode.  The generated file
+    # carries a placeholder secret on purpose: on an auth failure the plugin
+    # logs its full refresh request (secret included) to syslog.
+    if oauth-token-helper sasl-config > /etc/sasl-xoauth2.conf.new 2>/dev/null && \
+       mv -f /etc/sasl-xoauth2.conf.new /etc/sasl-xoauth2.conf 2>/dev/null ; then
+      chown root:postfix /etc/sasl-xoauth2.conf
+      chmod 0640 /etc/sasl-xoauth2.conf
+    else
+      rm -f /etc/sasl-xoauth2.conf.new
+      echo "WARNING: could not write /etc/sasl-xoauth2.conf (read-only mount?); leaving the existing file in place"
+    fi
+
+    # The token file lives inside the chroot; sasl_passwd refers to it as
+    # /etc/tokens/sender.tokens.json relative to /var/spool/postfix.
+    tokenDir=$(dirname "${OAUTH_TOKEN_FILE}")
+    mkdir -p "${tokenDir}"
+    chown root:postfix "${tokenDir}"
+    chmod 0750 "${tokenDir}"
+
+    oauth-token-helper daemon &
+    OAUTH_HELPER_PID=$!
+}
+
+# Give the helper a moment to obtain the first token so the first message is
+# not deferred.  Postfix starts regardless: mail queues until a token exists.
+oauthWaitForToken()
+{
+    if [ "${OAUTH_MODE}" != "client_credentials" ] ; then
+      return
+    fi
+    for (( i = 0 ; i < OAUTH_STARTUP_TIMEOUT ; i++ )) ; do
+      if oauth-token-helper status -q ; then
+        echo "OAuth access token is in place"
+        return
+      fi
+      sleep 1
+    done
+    echo "WARNING: no OAuth access token after ${OAUTH_STARTUP_TIMEOUT}s; starting Postfix anyway (mail is deferred until a token is obtained)"
+}
+
+#
+cleanExit()
+{
+    /bin/echo -e "stopping service Postfix \c"
+    service postfix stop
+    /bin/echo -e "stopping service OpenDKIM \c"
+    service opendkim stop
+    if [ -n "${OAUTH_HELPER_PID}" ] ; then
+      echo "stopping OAuth token helper"
+      kill -TERM "${OAUTH_HELPER_PID}" 2>/dev/null
+    fi
+    # copy sender tokens back to source iff changed (legacy refresh_token mode only)
+    if [ "${OAUTH_MODE}" == "refresh_token" ] ; then
+      cmp --quiet /etc/tokens/sender.tokens.json /var/spool/postfix/etc/tokens/sender.tokens.json || \
+        cp -vp /var/spool/postfix/etc/tokens/sender.tokens.json /etc/tokens/sender.tokens.json
+    fi
+    pkill -TERM rsyslogd
+}
+
+#
+cleanPIDs()
+{
+    rm -f \
+        /run/opendkim/opendkim.pid \
+        /run/rsyslogd.pid \
+        /var/spool/postfix/pid/master.pid
+}
+
+#
+postfixConfig()
+{
+    # POSTFIX_var env -> postconf -e var=$POSTFIX_var
+    for e in ${!POSTFIX_*} ; do postconf -e "${e:8}=${!e}" ; done
+    # POSTFIXMASTER_var env -> postconf -Me var=$POSTFIXMASTER_var + replace __ with /
+    for e in ${!POSTFIXMASTER_*} ; do v="${e:14}" && postconf -Me "${v/__/\/}=${!e}"; done
+    # POSTMAP_var env value -> /etc/postfix/var
+    for e in ${!POSTMAP_*} ; do echo "${!e}" > "/etc/postfix/${e:8}" && postmap "/etc/postfix/${e:8}"; done
+    chown -R postfix:postfix /var/lib/postfix /var/mail /var/spool/postfix
+}
+
+
+trap cleanExit  SIGTERM SIGINT
+
+
+# set defaults
+RSYSLOG_TIMESTAMP=${RSYSLOG_TIMESTAMP:-'yes'}
+RSYSLOG_LOG_TO_FILE=${RSYSLOG_LOG_TO_FILE:-'no'}
+RSYSLOG_REMOTE_PORT=${RSYSLOG_REMOTE_PORT:-'514'}
+RSYSLOG_REMOTE_TRANSPORT_PROTOCOL=${RSYSLOG_REMOTE_TRANSPORT_PROTOCOL:-'udp'}
+RSYSLOG_REMOTE_TEMPLATE=${RSYSLOG_REMOTE_TEMPLATE:-'RSYSLOG_ForwardFormat'}
+RSYSLOG_REMOTE_HOST=${RSYSLOG_REMOTE_HOST:-''}
+OAUTH_STARTUP_TIMEOUT=${OAUTH_STARTUP_TIMEOUT:-30}
+OAUTH_TOKEN_FILE=${OAUTH_TOKEN_FILE:-/var/spool/postfix/etc/tokens/sender.tokens.json}
+export OAUTH_TOKEN_FILE
+OAUTH_MODE=refresh_token
+OAUTH_HELPER_PID=
+
+
+# Unclean container stop might leave pid files around and rsyslogd seems
+# sometimes falsely think it's already running if some other process
+# happens to have its old pid when starting.
+cleanPIDs
+
+
+if [ ! -s /etc/rsyslog.conf ]; then
+  rsyslogConfig
+else
+  # Don't fiddle with existing rsyslog config file
+  echo "Skipping /etc/rsyslog.conf generation - file already exists"
+fi
+
+/bin/echo -e "\n\n"
+
+if [ ! -z "$OPENDKIM_DOMAINS" ] ; then
+  dkimConfig
+  /bin/echo -e "starting service OpenDKIM-"$(dpkg-query --show --showformat='${Version}' opendkim)" \c"
+  service opendkim start
+fi
+
+oauthConfig
+postfixConfig
+oauthWaitForToken
+/bin/echo -e "starting service Postfix-"$(dpkg-query --show --showformat='${Version}' postfix)" \c"
+service postfix start
+
+# install proper sender tokens into chroot iff neccessary (legacy refresh_token mode only)
+if [ "${OAUTH_MODE}" == "refresh_token" ] ; then
+  cmp --quiet /etc/tokens/sender.tokens.json /var/spool/postfix/etc/tokens/sender.tokens.json || \
+    cp -vp /etc/tokens/sender.tokens.json /var/spool/postfix/etc/tokens/sender.tokens.json
+fi
+
+/bin/echo -e "launching Rsyslog-"$(dpkg-query --show --showformat='${Version}' rsyslog)"\n"
+rsyslogd -n &
+
+wait
+
+if [ "${OAUTH_MODE}" == "refresh_token" ] ; then
+  cmp --quiet /etc/tokens/sender.tokens.json /var/spool/postfix/etc/tokens/sender.tokens.json || \
+    cp -vp /var/spool/postfix/etc/tokens/sender.tokens.json /etc/tokens/sender.tokens.json
+fi
+
+exit 0

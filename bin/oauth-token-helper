@@ -1,0 +1,713 @@
+#!/usr/bin/env python3
+# Part of postfix-relay-m365 (MIT licence, see LICENSE).
+"""
+oauth-token-helper - app-only (OAuth 2.0 client credentials) tokens for sasl-xoauth2.
+
+Obtains Microsoft Entra access tokens with the client-credentials grant and
+writes them atomically into the token file that sasl-xoauth2 reads
+(/etc/tokens/sender.tokens.json inside the Postfix chroot).  sasl-xoauth2 then
+only ever sends the cached access token; its own refresh_token path is never
+exercised, so MFA enforcement on the mailbox has no effect on SMTP.
+
+sasl-xoauth2 (0.27) facts this helper is built around:
+  * the token file MUST contain a "refresh_token" key or the plugin refuses to
+    read it - we write an empty string;
+  * "expiry" is parsed with stoi(asString()), so it is written as a string;
+  * the plugin refreshes on its own only when now + refresh_window (10s) >=
+    expiry, so keeping expiry ahead of the clock means it never touches the
+    network.
+
+Subcommands
+  daemon        obtain a token, write the token file, renew before expiry; runs forever
+  test          obtain a token once, report expiry and safe JWT claims (alias: oauth-token-test)
+  status        exit 0 if the token file holds an unexpired token (used by HEALTHCHECK)
+  mode          print the effective OAUTH_GRANT_TYPE
+  validate      check the configuration without contacting the token endpoint
+  sasl-config   print a /etc/sasl-xoauth2.conf suitable for client-credentials mode
+
+Environment
+  OAUTH_GRANT_TYPE        client_credentials | refresh_token
+                          default: client_credentials when OAUTH_TENANT_ID is set, else refresh_token
+  OAUTH_TENANT_ID         Entra tenant ID                 (or OAUTH_TENANT_ID_FILE)
+  OAUTH_CLIENT_ID         application (client) ID        (or OAUTH_CLIENT_ID_FILE)
+  OAUTH_CLIENT_SECRET     client secret                  (or OAUTH_CLIENT_SECRET_FILE;
+                          default file /run/secrets/oauth_client_secret when it exists)
+  OAUTH_SCOPE             default https://outlook.office365.com/.default
+  OAUTH_TOKEN_ENDPOINT    default https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token
+  OAUTH_TOKEN_FILE        default /var/spool/postfix/etc/tokens/sender.tokens.json
+  OAUTH_TOKEN_FILE_OWNER  default postfix:postfix (applied only when running as root)
+  OAUTH_REFRESH_MARGIN    seconds before expiry at which to renew, default 300
+  OAUTH_HTTP_TIMEOUT      seconds, default 30
+
+This program never logs the access token or the client secret.
+"""
+
+import argparse
+import base64
+import dataclasses
+import datetime
+import errno
+import json
+import logging
+import os
+import pwd
+import grp
+import random
+import signal
+import stat
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Dict, List, Optional, Tuple
+
+PROG = "oauth-token-helper"
+
+MODE_CLIENT_CREDENTIALS = "client_credentials"
+MODE_REFRESH_TOKEN = "refresh_token"
+
+DEFAULT_SCOPE = "https://outlook.office365.com/.default"
+DEFAULT_TOKEN_FILE = "/var/spool/postfix/etc/tokens/sender.tokens.json"
+DEFAULT_SECRET_FILE = "/run/secrets/oauth_client_secret"
+DEFAULT_TOKEN_FILE_OWNER = "postfix:postfix"
+DEFAULT_REFRESH_MARGIN = 300
+DEFAULT_HTTP_TIMEOUT = 30
+
+BACKOFF_INITIAL = 5       # seconds, first retry after a failed acquisition
+BACKOFF_MAX = 300         # seconds, cap for exponential backoff
+RETRY_AFTER_MAX = 900     # seconds, cap for a server-supplied Retry-After
+MIN_RENEWAL_WAIT = 30     # seconds, never spin faster than this on short-lived tokens
+
+REQUIRED_SMTP_ROLE = "SMTP.SendAsApp"
+OUTLOOK_AUDIENCES = (
+    "outlook.office365.com",
+    "outlook.office.com",
+    "outlook.office365.us",
+    "partner.outlook.cn",
+)
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+log = logging.getLogger(PROG)
+
+
+# --------------------------------------------------------------------------- logging
+
+class _Formatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if record.levelno >= logging.WARNING:
+            return "%s: %s: %s" % (PROG, record.levelname, msg)
+        return "%s: %s" % (PROG, msg)
+
+
+def setup_logging(stream=None) -> None:
+    handler = logging.StreamHandler(stream or sys.stderr)
+    handler.setFormatter(_Formatter())
+    log.handlers[:] = [handler]
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
+# --------------------------------------------------------------------------- config
+
+class ConfigError(Exception):
+    """Configuration is missing or invalid.  Not retryable."""
+
+
+class TokenError(Exception):
+    """The token endpoint refused or could not be reached.  Retryable."""
+
+    def __init__(self, message: str, status: Optional[int] = None,
+                 error: Optional[str] = None, description: Optional[str] = None,
+                 retry_after: Optional[int] = None, details: Optional[Dict[str, object]] = None):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.error = error
+        self.description = description
+        self.retry_after = retry_after
+        self.details = details or {}
+
+    def __str__(self) -> str:
+        parts = []
+        if self.status is not None:
+            parts.append("HTTP %d" % self.status)
+        if self.error:
+            parts.append(self.error)
+        head = " ".join(parts)
+        body = self.message
+        if self.description:
+            body = self.description
+        text = ("%s: %s" % (head, body)) if head else body
+        extras = ["%s=%s" % (k, v) for k, v in self.details.items() if v not in (None, "", [])]
+        if extras:
+            text += " (" + ", ".join(extras) + ")"
+        return text
+
+
+@dataclasses.dataclass(repr=False)
+class Config:
+    mode: str
+    tenant_id: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    secret_source: str = ""
+    scope: str = DEFAULT_SCOPE
+    token_endpoint: str = ""
+    token_file: str = DEFAULT_TOKEN_FILE
+    token_file_owner: str = DEFAULT_TOKEN_FILE_OWNER
+    refresh_margin: int = DEFAULT_REFRESH_MARGIN
+    http_timeout: int = DEFAULT_HTTP_TIMEOUT
+
+    def __repr__(self) -> str:  # never expose the secret
+        return ("Config(mode=%r, tenant_id=%r, client_id=%r, secret_source=%r, scope=%r, "
+                "token_endpoint=%r, token_file=%r, refresh_margin=%r)" % (
+                    self.mode, self.tenant_id, self.client_id, self.secret_source, self.scope,
+                    self.token_endpoint, self.token_file, self.refresh_margin))
+
+
+def _read_file_value(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def _env_or_file(env: Dict[str, str], name: str, default_file: Optional[str] = None) -> Tuple[str, str]:
+    """Resolve NAME / NAME_FILE.  Returns (value, source).  NAME_FILE wins when set."""
+    file_var = name + "_FILE"
+    path = env.get(file_var, "").strip()
+    if path:
+        try:
+            return _read_file_value(path), "%s=%s" % (file_var, path)
+        except OSError as e:
+            raise ConfigError("%s: cannot read %s: %s" % (file_var, path, e.strerror))
+    value = env.get(name, "")
+    if value.strip():
+        return value.strip(), name
+    if default_file and os.path.isfile(default_file):
+        try:
+            return _read_file_value(default_file), default_file
+        except OSError as e:
+            raise ConfigError("cannot read %s: %s" % (default_file, e.strerror))
+    return "", ""
+
+
+def effective_mode(env: Dict[str, str]) -> str:
+    explicit = env.get("OAUTH_GRANT_TYPE", "").strip().lower()
+    if explicit:
+        if explicit not in (MODE_CLIENT_CREDENTIALS, MODE_REFRESH_TOKEN):
+            raise ConfigError("OAUTH_GRANT_TYPE must be %s or %s (got %r)" % (
+                MODE_CLIENT_CREDENTIALS, MODE_REFRESH_TOKEN, explicit))
+        return explicit
+    tenant, _ = _env_or_file(env, "OAUTH_TENANT_ID")
+    return MODE_CLIENT_CREDENTIALS if tenant else MODE_REFRESH_TOKEN
+
+
+def _int_env(env: Dict[str, str], name: str, default: int, minimum: int = 0) -> int:
+    raw = env.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError("%s must be an integer (got %r)" % (name, raw))
+    if value < minimum:
+        raise ConfigError("%s must be >= %d (got %d)" % (name, minimum, value))
+    return value
+
+
+def load_config(env: Optional[Dict[str, str]] = None) -> Config:
+    env = dict(os.environ if env is None else env)
+    mode = effective_mode(env)
+    cfg = Config(mode=mode)
+    cfg.token_file = env.get("OAUTH_TOKEN_FILE", "").strip() or DEFAULT_TOKEN_FILE
+    cfg.token_file_owner = env.get("OAUTH_TOKEN_FILE_OWNER", "").strip() or DEFAULT_TOKEN_FILE_OWNER
+    if mode != MODE_CLIENT_CREDENTIALS:
+        return cfg
+
+    problems: List[str] = []
+    cfg.tenant_id, _ = _env_or_file(env, "OAUTH_TENANT_ID")
+    cfg.client_id, _ = _env_or_file(env, "OAUTH_CLIENT_ID")
+    cfg.client_secret, cfg.secret_source = _env_or_file(env, "OAUTH_CLIENT_SECRET", DEFAULT_SECRET_FILE)
+    cfg.token_endpoint = env.get("OAUTH_TOKEN_ENDPOINT", "").strip()
+    if not cfg.tenant_id and not cfg.token_endpoint:
+        problems.append("OAUTH_TENANT_ID (or OAUTH_TENANT_ID_FILE) is required")
+    if not cfg.client_id:
+        problems.append("OAUTH_CLIENT_ID (or OAUTH_CLIENT_ID_FILE) is required")
+    if not cfg.client_secret:
+        problems.append("OAUTH_CLIENT_SECRET, OAUTH_CLIENT_SECRET_FILE or %s is required" % DEFAULT_SECRET_FILE)
+    if not cfg.token_endpoint:
+        cfg.token_endpoint = "https://login.microsoftonline.com/%s/oauth2/v2.0/token" % cfg.tenant_id
+    cfg.scope = env.get("OAUTH_SCOPE", "").strip() or DEFAULT_SCOPE
+
+    parts = urllib.parse.urlsplit(cfg.token_endpoint)
+    if parts.scheme == "http":
+        if (parts.hostname or "") not in LOOPBACK_HOSTS:
+            problems.append("OAUTH_TOKEN_ENDPOINT must use https (plain http is allowed only for loopback test endpoints)")
+    elif parts.scheme != "https" or not parts.netloc:
+        problems.append("OAUTH_TOKEN_ENDPOINT is not a valid https URL: %r" % cfg.token_endpoint)
+
+    try:
+        cfg.refresh_margin = _int_env(env, "OAUTH_REFRESH_MARGIN", DEFAULT_REFRESH_MARGIN, 0)
+        cfg.http_timeout = _int_env(env, "OAUTH_HTTP_TIMEOUT", DEFAULT_HTTP_TIMEOUT, 1)
+    except ConfigError as e:
+        problems.append(str(e))
+
+    if problems:
+        raise ConfigError("; ".join(problems))
+    return cfg
+
+
+# --------------------------------------------------------------------------- token acquisition
+
+@dataclasses.dataclass(repr=False)
+class Token:
+    access_token: str
+    expires_in: int
+    expiry: int           # unix time
+    token_type: str = "Bearer"
+    status: int = 200
+
+    def __repr__(self) -> str:  # never expose the token
+        return "Token(expires_in=%d, expiry=%d, token_type=%r)" % (self.expires_in, self.expiry, self.token_type)
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return min(int(value), RETRY_AFTER_MAX)
+    return None
+
+
+def _parse_error_body(body: bytes) -> Dict[str, object]:
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _truncate(text: str, limit: int = 600) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def acquire_token(cfg: Config, now=None) -> Token:
+    """Perform the client-credentials grant.  Raises TokenError on any failure."""
+    now = now or time.time
+    form = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": cfg.client_id,
+        "client_secret": cfg.client_secret,
+        "scope": cfg.scope,
+    }).encode("ascii")
+    request = urllib.request.Request(
+        cfg.token_endpoint, data=form, method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "User-Agent": "postfix-relay-m365/%s" % PROG,
+        })
+    started = now()
+    try:
+        # urlopen verifies the server certificate against the system CA bundle
+        # by default; that is deliberately not overridden anywhere.
+        with urllib.request.urlopen(request, timeout=cfg.http_timeout) as response:
+            status = response.status
+            body = response.read()
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read() if e.fp is not None else b""
+        except OSError:
+            body = b""
+        finally:
+            if e.fp is not None:
+                e.close()
+        data = _parse_error_body(body)
+        error = str(data.get("error") or "")
+        description = _truncate(str(data.get("error_description") or "")) or None
+        if not error and not description:
+            description = _truncate(body.decode("utf-8", "replace")) or e.reason
+        raise TokenError(
+            "token request rejected", status=e.code, error=error or None, description=description,
+            retry_after=_parse_retry_after(e.headers.get("Retry-After") if e.headers else None),
+            details={
+                "error_codes": data.get("error_codes"),
+                "trace_id": data.get("trace_id"),
+                "correlation_id": data.get("correlation_id"),
+            })
+    except urllib.error.URLError as e:
+        raise TokenError("token request failed: %s" % (getattr(e, "reason", e),))
+    except (OSError, ValueError) as e:
+        raise TokenError("token request failed: %s" % (e,))
+
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except ValueError:
+        raise TokenError("token endpoint returned a non-JSON body", status=status,
+                         description=_truncate(body.decode("utf-8", "replace"), 200))
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise TokenError("token endpoint response has no access_token", status=status)
+    try:
+        expires_in = int(str(data.get("expires_in", "")).strip())
+    except ValueError:
+        raise TokenError("token endpoint response has no usable expires_in", status=status)
+    if expires_in <= 0:
+        raise TokenError("token endpoint returned a non-positive expires_in (%d)" % expires_in, status=status)
+    return Token(
+        access_token=str(data["access_token"]),
+        expires_in=expires_in,
+        expiry=int(started) + expires_in,
+        token_type=str(data.get("token_type") or "Bearer"),
+        status=status,
+    )
+
+
+# --------------------------------------------------------------------------- token file
+
+def _resolve_owner(spec: str) -> Tuple[int, int]:
+    user, _, group = spec.partition(":")
+    uid = pwd.getpwnam(user).pw_uid
+    gid = grp.getgrnam(group).gr_gid if group else pwd.getpwnam(user).pw_gid
+    return uid, gid
+
+
+def write_token_file(path: str, token: Token, cfg: Config) -> None:
+    """Write the sasl-xoauth2 token file atomically (temp file + fsync + rename)."""
+    document = {
+        "access_token": token.access_token,
+        "expiry": str(token.expiry),
+        # sasl-xoauth2 refuses to read the file without this key.  Client
+        # credentials never yield a refresh token; an empty value makes the
+        # plugin's (never expected) fallback refresh fail cleanly.
+        "refresh_token": "",
+        "token_endpoint": cfg.token_endpoint,
+        "_managed_by": PROG,
+    }
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".%s." % os.path.basename(path), dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(document, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if os.geteuid() == 0 and cfg.token_file_owner:
+            try:
+                uid, gid = _resolve_owner(cfg.token_file_owner)
+                os.chown(tmp_path, uid, gid)
+            except KeyError:
+                log.warning("owner %r not found; leaving %s owned by root", cfg.token_file_owner, path)
+        os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    try:
+        dir_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def read_token_file_expiry(path: str) -> Optional[int]:
+    """Return the expiry (unix time) recorded in an existing token file, or None."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or not data.get("access_token"):
+            return None
+        return int(str(data.get("expiry", "0")).strip() or "0")
+    except (OSError, ValueError):
+        return None
+
+
+def existing_token_validity(path: str, now: Optional[float] = None) -> Optional[int]:
+    """Seconds of validity left in the on-disk token, or None if absent/expired."""
+    expiry = read_token_file_expiry(path)
+    if expiry is None:
+        return None
+    remaining = expiry - int(now if now is not None else time.time())
+    return remaining if remaining > 0 else None
+
+
+# --------------------------------------------------------------------------- JWT inspection
+
+def decode_jwt_claims(token: str) -> Optional[Dict[str, object]]:
+    """Decode the payload of a JWT without verifying it.  Returns None if not a JWT."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        data = json.loads(base64.urlsafe_b64decode(payload.encode("ascii")).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _fmt_time(ts) -> str:
+    try:
+        return datetime.datetime.fromtimestamp(int(ts), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return str(ts)
+
+
+SAFE_CLAIMS = ("aud", "iss", "appid", "azp", "app_displayname", "tid", "roles", "ver")
+TIME_CLAIMS = ("iat", "nbf", "exp")
+
+
+def safe_claims(claims: Dict[str, object]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    for name in SAFE_CLAIMS:
+        if name in claims:
+            value = claims[name]
+            out.append((name, ", ".join(map(str, value)) if isinstance(value, list) else str(value)))
+    for name in TIME_CLAIMS:
+        if name in claims:
+            out.append((name, "%s (%s)" % (claims[name], _fmt_time(claims[name]))))
+    return out
+
+
+def smtp_role_check(claims: Optional[Dict[str, object]]) -> Tuple[bool, str]:
+    """(ok, message).  ok is False only when the token is clearly unusable for SMTP AUTH."""
+    if not claims:
+        return True, "token is not a decodable JWT; role check skipped"
+    aud = str(claims.get("aud", ""))
+    if not any(host in aud for host in OUTLOOK_AUDIENCES):
+        return True, "audience %r is not an Outlook resource; role check skipped" % aud
+    roles = claims.get("roles")
+    roles = roles if isinstance(roles, list) else []
+    if REQUIRED_SMTP_ROLE in roles:
+        return True, "%s role present" % REQUIRED_SMTP_ROLE
+    return False, ("token has no %s role (roles=%s). Grant the 'Office 365 Exchange Online > %s' "
+                   "application permission, give admin consent, and register the service principal "
+                   "in Exchange Online" % (REQUIRED_SMTP_ROLE, roles or "none", REQUIRED_SMTP_ROLE))
+
+
+# --------------------------------------------------------------------------- daemon
+
+def _renewal_wait(token: Token, margin: int) -> int:
+    wait = token.expires_in - margin
+    if wait < MIN_RENEWAL_WAIT:
+        wait = max(MIN_RENEWAL_WAIT, token.expires_in // 2)
+        log.warning("token lifetime (%ds) is shorter than OAUTH_REFRESH_MARGIN (%ds); renewing every %ds",
+                    token.expires_in, margin, wait)
+    return wait
+
+
+def _backoff_wait(backoff: int, retry_after: Optional[int], rng=random.random) -> int:
+    if retry_after:
+        return max(retry_after, 1)
+    jitter = 0.8 + 0.4 * rng()
+    return max(1, int(backoff * jitter))
+
+
+def run_daemon(cfg: Config, stop: threading.Event, wait_fn=None, acquire=acquire_token,
+               writer=write_token_file, now=time.time) -> None:
+    """Acquire/renew forever.  Never raises for endpoint failures; logs and retries."""
+    wait_fn = wait_fn or stop.wait
+    log.info("mode=%s tenant=%s client_id=%s scope=%s", cfg.mode, cfg.tenant_id or "-", cfg.client_id, cfg.scope)
+    log.info("token endpoint: %s", cfg.token_endpoint)
+    log.info("token file: %s (renew %ds before expiry; secret from %s)",
+             cfg.token_file, cfg.refresh_margin, cfg.secret_source)
+    backoff = BACKOFF_INITIAL
+    while not stop.is_set():
+        try:
+            token = acquire(cfg)
+            writer(cfg.token_file, token, cfg)
+        except TokenError as e:
+            remaining = existing_token_validity(cfg.token_file, now())
+            log.error("failed to obtain access token: %s", e)
+            if remaining:
+                log.warning("keeping existing token, still valid for %d seconds", remaining)
+            else:
+                log.warning("no valid token on disk; SMTP authentication will fail until one is obtained")
+            wait = _backoff_wait(backoff, e.retry_after)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+            log.info("retrying in %d seconds", wait)
+        except Exception as e:  # noqa: BLE001 - the daemon must never die on a surprise
+            log.error("unexpected error (%s): %s", type(e).__name__, e)
+            wait = _backoff_wait(backoff, None)
+            backoff = min(backoff * 2, BACKOFF_MAX)
+            log.info("retrying in %d seconds", wait)
+        else:
+            backoff = BACKOFF_INITIAL
+            wait = _renewal_wait(token, cfg.refresh_margin)
+            log.info("OAuth access token refreshed; expires in %d seconds (%s); next renewal in %d seconds",
+                     token.expires_in, _fmt_time(token.expiry), wait)
+        wait_fn(wait)
+    log.info("stopping")
+
+
+# --------------------------------------------------------------------------- commands
+
+def _load_or_die() -> Config:
+    try:
+        return load_config()
+    except ConfigError as e:
+        log.error("configuration error: %s", e)
+        sys.exit(1)
+
+
+def cmd_daemon(args: argparse.Namespace) -> int:
+    cfg = _load_or_die()
+    if cfg.mode != MODE_CLIENT_CREDENTIALS:
+        log.error("daemon is only meaningful with OAUTH_GRANT_TYPE=%s (effective mode: %s)",
+                  MODE_CLIENT_CREDENTIALS, cfg.mode)
+        return 1
+    stop = threading.Event()
+
+    def _stop(signum, _frame):
+        log.info("received signal %d", signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    run_daemon(cfg, stop)
+    return 0
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    cfg = _load_or_die()
+    out = sys.stdout
+    print("mode:           %s" % cfg.mode, file=out)
+    if cfg.mode != MODE_CLIENT_CREDENTIALS:
+        print("Legacy refresh_token mode: sasl-xoauth2 manages the token itself, nothing to test here.", file=out)
+        print("Set OAUTH_TENANT_ID / OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET(_FILE) for app-only mode.", file=out)
+        return 0
+    print("tenant:         %s" % (cfg.tenant_id or "(endpoint override)"), file=out)
+    print("client_id:      %s" % cfg.client_id, file=out)
+    print("client_secret:  from %s (%d chars, not shown)" % (cfg.secret_source, len(cfg.client_secret)), file=out)
+    print("scope:          %s" % cfg.scope, file=out)
+    print("token endpoint: %s" % cfg.token_endpoint, file=out)
+    print("token file:     %s%s" % (cfg.token_file, "" if args.write else " (not written; use --write)"), file=out)
+    try:
+        token = acquire_token(cfg)
+    except TokenError as e:
+        print("FAILED: %s" % e, file=out)
+        return 1
+    print("OK: access token obtained (HTTP %d, token_type=%s); expires in %d seconds (%s)" % (
+        token.status, token.token_type, token.expires_in, _fmt_time(token.expiry)), file=out)
+    claims = decode_jwt_claims(token.access_token)
+    if claims:
+        print("JWT claims (safe subset):", file=out)
+        for name, value in safe_claims(claims):
+            print("  %-16s %s" % (name + ":", value), file=out)
+    else:
+        print("access token is not a decodable JWT (opaque token); claims not shown", file=out)
+    ok, message = smtp_role_check(claims)
+    print(("role check:     OK - %s" if ok else "role check:     WARNING - %s") % message, file=out)
+    if args.write:
+        try:
+            write_token_file(cfg.token_file, token, cfg)
+        except OSError as e:
+            print("FAILED to write %s: %s" % (cfg.token_file, e), file=out)
+            return 1
+        print("token file written: %s" % cfg.token_file, file=out)
+    return 0 if ok else 2
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_config()
+    except ConfigError as e:
+        if not args.quiet:
+            print("configuration error: %s" % e)
+        return 1
+    if cfg.mode != MODE_CLIENT_CREDENTIALS:
+        if not args.quiet:
+            print("legacy %s mode; token file is managed by sasl-xoauth2" % cfg.mode)
+        return 0
+    remaining = existing_token_validity(cfg.token_file)
+    if remaining is None:
+        if not args.quiet:
+            print("no valid token in %s" % cfg.token_file)
+        return 1
+    if not args.quiet:
+        print("token in %s valid for %d seconds" % (cfg.token_file, remaining))
+    return 0
+
+
+def cmd_mode(args: argparse.Namespace) -> int:
+    try:
+        print(effective_mode(dict(os.environ)))
+    except ConfigError as e:
+        log.error("configuration error: %s", e)
+        return 1
+    return 0
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    cfg = _load_or_die()
+    if cfg.mode == MODE_CLIENT_CREDENTIALS:
+        log.info("configuration OK: %r", cfg)
+    else:
+        log.info("legacy %s mode; nothing to validate", cfg.mode)
+    return 0
+
+
+def sasl_config_document(cfg: Config) -> Dict[str, str]:
+    # sasl-xoauth2 insists on client_id and client_secret being present even
+    # though, in client-credentials mode, it never performs a refresh itself.
+    # A placeholder secret is written on purpose: the plugin logs the full
+    # refresh request body (secret included) to syslog on auth failure.
+    return {
+        "client_id": cfg.client_id,
+        "client_secret": "not-used-in-client-credentials-mode",
+        "token_endpoint": cfg.token_endpoint,
+        "_managed_by": PROG,
+    }
+
+
+def cmd_sasl_config(args: argparse.Namespace) -> int:
+    cfg = _load_or_die()
+    if cfg.mode != MODE_CLIENT_CREDENTIALS:
+        log.error("sasl-config is only meaningful in %s mode" % MODE_CLIENT_CREDENTIALS)
+        return 1
+    json.dump(sasl_config_document(cfg), sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=PROG, description=__doc__.split("\n\n")[1],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", metavar="command")
+    sub.required = True
+    sub.add_parser("daemon", help="obtain and renew tokens forever").set_defaults(fn=cmd_daemon)
+    p = sub.add_parser("test", help="obtain a token once and report on it (never prints the token)")
+    p.add_argument("--write", action="store_true", help="also write the token file")
+    p.set_defaults(fn=cmd_test)
+    p = sub.add_parser("status", help="exit 0 if an unexpired token is on disk")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.set_defaults(fn=cmd_status)
+    sub.add_parser("mode", help="print the effective OAUTH_GRANT_TYPE").set_defaults(fn=cmd_mode)
+    sub.add_parser("validate", help="check configuration without network access").set_defaults(fn=cmd_validate)
+    sub.add_parser("sasl-config", help="print /etc/sasl-xoauth2.conf for this mode").set_defaults(fn=cmd_sasl_config)
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    setup_logging()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Installed as `oauth-token-test` -> behave as `oauth-token-helper test`.
+    if os.path.basename(sys.argv[0]) == "oauth-token-test" and (not argv or argv[0].startswith("-")):
+        argv.insert(0, "test")
+    args = build_parser().parse_args(argv)
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+# Part of postfix-relay-m365 (MIT licence, see LICENSE).
+"""
+smtp-send-test - push one test message through the local Postfix relay.
+
+Inside the container (port 25, no auth):
+    docker compose exec postfix smtp-send-test --from relay@example.com --to you@example.com --wait 60
+
+From the host against the published port:
+    bin/smtp-send-test --host 127.0.0.1 --port 1025 --from relay@example.com --to you@example.com
+
+The relay accepts the message and hands back a Postfix queue ID.  With --wait
+(only useful inside the container, where postqueue exists) the script polls the
+queue until that ID is gone, which means Postfix has delivered or bounced it,
+and prints the queue entry (with the deferral reason) if it is still stuck.
+"""
+
+import argparse
+import datetime
+import os
+import re
+import shutil
+import smtplib
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from email.message import EmailMessage
+
+
+def build_message(sender: str, recipient: str, subject: str, marker: str) -> EmailMessage:
+    msg = EmailMessage()
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg["Subject"] = subject
+    msg["Message-ID"] = "<%s@%s>" % (marker, socket.gethostname())
+    msg["X-Relay-Test"] = marker
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    msg.set_content(
+        "Test message from postfix-relay-m365 smtp-send-test.\n\n"
+        "sent:    %s\nmarker:  %s\nfrom:    %s\nto:      %s\n" % (now, marker, sender, recipient))
+    return msg
+
+
+def send(host: str, port: int, sender: str, recipient: str, msg: EmailMessage, timeout: int) -> str:
+    with smtplib.SMTP(host, port, timeout=timeout) as smtp:
+        smtp.ehlo_or_helo_if_needed()
+        code, reply = smtp.mail(sender)
+        if code != 250:
+            raise smtplib.SMTPSenderRefused(code, reply, sender)
+        code, reply = smtp.rcpt(recipient)
+        if code not in (250, 251):
+            raise smtplib.SMTPRecipientsRefused({recipient: (code, reply)})
+        code, reply = smtp.data(msg.as_bytes())
+        if code != 250:
+            raise smtplib.SMTPDataError(code, reply)
+        return reply.decode("utf-8", "replace") if isinstance(reply, bytes) else str(reply)
+
+
+def queue_entry(queue_id: str) -> str:
+    """Return the postqueue -p block for queue_id, or '' if it is no longer queued."""
+    out = subprocess.run(["postqueue", "-p"], capture_output=True, text=True, check=False).stdout
+    block = []
+    for line in out.splitlines():
+        if line.startswith(queue_id):
+            block = [line]
+        elif block and line.strip() and not block[-1] == "":
+            block.append(line)
+        elif block and not line.strip():
+            break
+    return "\n".join(block)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="smtp-send-test", description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--host", default=os.environ.get("SMTP_TEST_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("SMTP_TEST_PORT", "25")))
+    parser.add_argument("--from", dest="sender",
+                        default=os.environ.get("SMTP_TEST_FROM") or os.environ.get("SENDER_ADDRESS", ""),
+                        help="envelope/From address; must be the mailbox the app may send as (default: $SENDER_ADDRESS)")
+    parser.add_argument("--to", dest="recipient", required=True, help="recipient address")
+    parser.add_argument("--subject", default="postfix-relay-m365 test message")
+    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--wait", type=int, default=0, metavar="SECONDS",
+                        help="poll the local Postfix queue until the message leaves it (needs postqueue)")
+    args = parser.parse_args()
+    if not args.sender:
+        parser.error("--from is required (or set SENDER_ADDRESS)")
+
+    marker = "relaytest-" + uuid.uuid4().hex[:12]
+    msg = build_message(args.sender, args.recipient, "%s [%s]" % (args.subject, marker), marker)
+    print("connecting to %s:%d" % (args.host, args.port))
+    try:
+        reply = send(args.host, args.port, args.sender, args.recipient, msg, args.timeout)
+    except (smtplib.SMTPException, OSError) as e:
+        print("FAILED: relay did not accept the message: %s" % e)
+        return 1
+    match = re.search(r"queued as (\S+)", reply)
+    queue_id = match.group(1) if match else ""
+    print("accepted by relay: %s" % reply.strip())
+    print("marker: %s" % marker)
+
+    if not queue_id:
+        print("no queue ID in the reply; check the relay logs for marker %s" % marker)
+        return 0
+    if args.wait <= 0 or not shutil.which("postqueue"):
+        print("follow up with:  docker compose logs postfix | grep %s" % queue_id)
+        if args.wait > 0:
+            print("(--wait ignored: postqueue is not available here; run this inside the container)")
+        return 0
+
+    deadline = time.time() + args.wait
+    while time.time() < deadline:
+        entry = queue_entry(queue_id)
+        if not entry:
+            print("OK: %s has left the local queue (delivered to smtp.office365.com, or bounced)." % queue_id)
+            print("confirm with:  docker compose logs postfix | grep %s   (look for status=sent)" % queue_id)
+            return 0
+        time.sleep(2)
+    print("STILL QUEUED after %ds:" % args.wait)
+    print(queue_entry(queue_id))
+    print("check:  docker compose logs postfix | grep -E '%s|sasl|xoauth2'" % queue_id)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

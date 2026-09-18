@@ -1,0 +1,64 @@
+# Postfix relay to Microsoft 365 using app-only (client credentials) OAuth.
+#
+# Deployment-specific values come from .env (copy .env.example) and the Entra
+# client secret from ./secrets/oauth_client_secret.  Neither file is committed.
+# Full setup, including the Entra / Exchange Online side, is in INSTALL.md.
+#
+#   docker compose up -d
+#   docker compose exec postfix oauth-token-test
+#   docker compose exec postfix smtp-send-test --to you@example.com --wait 60
+
+services:
+  postfix:
+    image: encode/postfix-relay-m365:latest
+    build: .
+    restart: unless-stopped
+    container_name: postfix
+    ports:
+      # Clients submit here without authentication; the container trusts the
+      # network it is exposed to.  SMTP_LISTEN may be "1025" or "192.0.2.10:1025".
+      - "${SMTP_LISTEN:-1025}:25"
+    environment:
+      TZ: ${TZ:-UTC}
+      POSTFIX_myhostname: ${POSTFIX_MYHOSTNAME:?set POSTFIX_MYHOSTNAME in .env}
+      #OPENDKIM_DOMAINS: ${POSTFIX_MYHOSTNAME}
+
+      # Outbound: relay everything to Microsoft 365 over TLS with XOAUTH2.
+      # IPv4 only: the container usually has no IPv6 route, and Postfix would
+      # otherwise try every AAAA record of smtp.office365.com before falling
+      # back ("Network is unreachable" x3 and a few seconds per message).
+      POSTFIX_inet_protocols: ipv4
+      POSTFIX_smtp_use_tls: "yes"
+      POSTFIX_smtp_sasl_auth_enable: "yes"
+      POSTFIX_smtp_sasl_security_options: noanonymous
+      POSTFIX_smtp_sasl_mechanism_filter: xoauth2
+      POSTFIX_smtp_tls_security_level: encrypt
+      POSTFIX_smtp_tls_CAfile: /etc/ssl/certs/ca-certificates.crt
+      POSTFIX_transport_maps: hash:/etc/postfix/transport
+      POSTMAP_transport: "*       relay:[smtp.office365.com]:587"
+      POSTFIX_smtp_sasl_password_maps: hash:/etc/postfix/sasl_passwd
+      # username = the mailbox the app may send as (XOAUTH2 "user");
+      # "password" = the token file, path as seen inside the Postfix chroot,
+      # which oauth-token-helper keeps fresh.
+      POSTMAP_sasl_passwd: "[smtp.office365.com]:587   ${SENDER_ADDRESS:?set SENDER_ADDRESS in .env}:/etc/tokens/sender.tokens.json"
+
+      # App-only OAuth (client credentials).  The client secret is a Docker
+      # secret, never an environment variable.
+      OAUTH_GRANT_TYPE: client_credentials
+      OAUTH_TENANT_ID: ${OAUTH_TENANT_ID:?set OAUTH_TENANT_ID in .env}
+      OAUTH_CLIENT_ID: ${OAUTH_CLIENT_ID:?set OAUTH_CLIENT_ID in .env}
+      OAUTH_CLIENT_SECRET_FILE: /run/secrets/oauth_client_secret
+      #OAUTH_SCOPE: https://outlook.office365.com/.default
+      #OAUTH_REFRESH_MARGIN: "300"
+    secrets:
+      - oauth_client_secret
+    volumes:
+      # Keep the mail queue across container re-creation.
+      - postfix-spool:/var/spool/postfix
+
+secrets:
+  oauth_client_secret:
+    file: ./secrets/oauth_client_secret
+
+volumes:
+  postfix-spool:
